@@ -48,7 +48,7 @@ def format_rag_prompt(query: str, context_chunks: List[str]) -> List[Dict[str, s
 class RAGPipeline:
     """
     End-to-End RAG Pipeline:
-    1. Query embedding & ChromaDB vector retrieval
+    1. Query embedding & ChromaDB vector retrieval (with optional metadata filtering)
     2. Context injection & Prompt engineering
     3. LLM generation with error handling
     4. Hallucination detection & latency benchmarking
@@ -75,32 +75,42 @@ class RAGPipeline:
             logger.warning(f"Could not load collection '{collection_name}': {e}. Collection will need to be created.")
             self.collection = None
 
-    def retrieve(self, query: str, top_k: int = 3) -> Dict[str, Any]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+        filter_metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
-        Retrieves top_k relevant chunks from ChromaDB for a given query.
-        Returns retrieved chunks, distance scores, and retrieval latency.
+        Retrieves top_k relevant chunks from ChromaDB for a given query with optional metadata filtering (where={...}).
         """
         start_time = time.time()
         
         if not self.collection:
             retrieval_latency = time.time() - start_time
-            return {"chunks": [], "distances": [], "latency": retrieval_latency}
+            return {"chunks": [], "distances": [], "metadatas": [], "latency": retrieval_latency}
 
         query_embedding = self.embedder.encode([query])[0].tolist()
         
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k
-        )
+        query_kwargs = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k
+        }
+        if filter_metadata:
+            query_kwargs["where"] = filter_metadata
+        
+        results = self.collection.query(**query_kwargs)
         
         retrieval_latency = time.time() - start_time
         
         chunks = results['documents'][0] if results.get('documents') else []
         distances = results['distances'][0] if results.get('distances') else []
+        metadatas = results['metadatas'][0] if results.get('metadatas') else []
         
         return {
             "chunks": chunks,
             "distances": distances,
+            "metadatas": metadatas,
             "latency": retrieval_latency
         }
 
@@ -124,13 +134,11 @@ class RAGPipeline:
                 "reason": "Answer generated despite empty context (potential hallucination)."
             }
 
-        # Check keyword/semantic overlap for basic hallucination detection
         answer_words = set(answer.lower().split())
         context_words = set(" ".join(context_chunks).lower().split())
         overlap = answer_words.intersection(context_words)
         
         overlap_ratio = len(overlap) / max(len(answer_words), 1)
-        
         is_grounded = overlap_ratio > 0.2
         
         return {
@@ -140,16 +148,22 @@ class RAGPipeline:
             "reason": "Grounded in context" if is_grounded else "Low lexical overlap with context (potential hallucination)."
         }
 
-    def query(self, user_query: str, top_k: int = 3) -> Dict[str, Any]:
+    def query(
+        self,
+        user_query: str,
+        top_k: int = 3,
+        filter_metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Executes end-to-end RAG workflow:
-        Retrieve -> Prompt -> Generate -> Verify -> Benchmark Latency
+        Retrieve (with optional metadata filter) -> Prompt -> Generate -> Verify -> Benchmark Latency
         """
         overall_start = time.time()
         
         # 1. Retrieval
-        retrieval_res = self.retrieve(user_query, top_k=top_k)
+        retrieval_res = self.retrieve(user_query, top_k=top_k, filter_metadata=filter_metadata)
         chunks = retrieval_res["chunks"]
+        metadatas = retrieval_res["metadatas"]
         retrieval_latency = retrieval_res["latency"]
         
         # 2. Prompt Formatting
@@ -169,6 +183,7 @@ class RAGPipeline:
             "query": user_query,
             "answer": answer,
             "retrieved_chunks": chunks,
+            "retrieved_metadatas": metadatas,
             "groundedness_check": groundedness,
             "latency": {
                 "retrieval_s": round(retrieval_latency, 4),
